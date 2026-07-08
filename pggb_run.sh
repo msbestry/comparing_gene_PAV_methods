@@ -2,7 +2,7 @@
 
 cat *_Genome.updated.fasta > brassica_pggb_input.fasta
 
-# Rename contig names to match PGGB convention:
+# Rename contig names to match PanSN convention:
 
 sed 's/_/#1#/g' brassica_pggb_input.fasta > brassica_pggb_input.renamed.fasta
 
