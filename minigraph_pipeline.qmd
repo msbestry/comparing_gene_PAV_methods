@@ -1,0 +1,1243 @@
+---
+title: "Brassica graph pangenome"
+format:
+  pdf:
+    theme: cosmo
+execute:
+  enabled: false
+  echo: true
+---
+
+# Intro
+this is just my version of Mitch/Teng/Phillip/Tessa's various versions of scripts for making the B. napus graph pangenome and an structurally annotated segment PAV matrix. I have tried automating it as much as possible, but I understand when dealing with huge data it is not possible to run the whole thing within 24 hours. So the compromise is to just edit the paths to fit your folder system, and then the only edit would be to copy paste all the path aliases to the start of each step and it should also work with no problem.
+
+The code should automatically detect the number of genome/assembly files and iterate minigraph over all of them, using whatever you choose as reference first.
+
+Below are the only things you should change to fit your file names and folders. It may be an overkill but every time I created new sets of files, I put them in their own folder. this is to be able to use wildcares easily and not needing to rely on anything about the file name (sometimes a genome is called ABC1.fasta, or ABC1_genome.fasta, or ABC1.V2_Genome.fasta, so using *.fasta is simpler but relies on nothing else being in the folder).
+
+
+```{bash}
+########CHANGE THESE TO FIT YOUR FILES AND FOLDERS
+#your working directory
+WORKDIR="$MYSCRATCH/brassica2"
+#where are your assemblies in .fasta format
+GENOMES_DIR="$WORKDIR/genomes"
+#number of threads to use for commands
+THREADS=20
+#Species name. this is for naming of files
+species="Bnapus"
+#genome/assembly that will be used as reference in minigraph
+REF="$GENOMES_RENAMED_DIR/a55015_Genome_renamed.fasta"
+
+
+####these ones below do not need to be edited, unless you want a different folder naming system. but they should be copy/pasted to certain steps. but just to be safe copy/paste them all at each step. it won't hurt.
+#folder for some logs
+LOGDIR="$WORKDIR/logs"
+#folder for some QC stats and summaries
+QCDIR="$WORKDIR/QC_stats"
+#folder for .fasta assemblies after renaming contigs
+GENOMES_RENAMED_DIR="$GENOMES_DIR/renamed"
+#folder for .fasta assemblies after renaming contigs back to their original
+GENOMES_RENAMED_AGAIN_DIR="$GENOMES_RENAMED_DIR/again"
+#folder for the outputs of minigraph rounds as .gfa and after transforming to .bed file
+MINIDIR="$WORKDIR/minigraph_output"
+#folder for the outputs of .gfa graph after sorting it
+MINIDIR_SORTED="$MINIDIR/sorted"
+#folder for .gaf file output of mapping of each genome agains the .sorted.bed graph file
+MAPDIR="$WORKDIR/graph_map"
+#folder for the transformed .gaf files into .bed files
+MAPDIR_BED="$MAPDIR/gaf_to_bed"
+#folder for after sorting the .bed files for each .gaf mapping
+MAPDIR_BED_SORTED="$MAPDIR_BED/sorted"
+#folder for the PAV matrix
+PAV_DIR="$WORKDIR/PAV_OUT"
+#folder for the .gff annotations of each genome.
+GFF_DIR="$WORKDIR/genome_annotation"
+
+#genome/assembly that will be used as reference in minigraph
+REF="$GENOMES_RENAMED_DIR/a55015_Genome_renamed.fasta"
+
+```
+
+
+
+## 1) Getting the tools and genomes I need
+couple of tools I installed with miniconda. gaftools and gfatools had some conflicts with someone in the first env I created, so I had to keep them separate.
+
+From here down I give the 'raw' code. it is up to you whether you want to make it a sbatch job, or run it in salloc.
+
+```{bash}
+#load module
+module load bedtools/2.30.0--h468198e_3
+
+#creating an env in stracth
+conda create --prefix "$MYSCRATCH/conda_env/pangenomes" -c bioconda -c conda-forge \
+  minimap2=2.30 \
+  seqkit=2.13.0 \
+  minigraph==0.21 \
+  assembly-stats=1.0.1
+
+#creating a separate env for gaftools because its dependencies clashed with other packages from the pangenomes env
+conda create --prefix "$MYSCRATCH/conda_env/gaftools" -c bioconda -c conda-forge \
+    gaftools==1.3.1 \
+    gfatools==0.5.5
+
+#activate the env
+conda activate "$MYSCRATCH/conda_env/pangenomes"
+```
+
+## 2) Get genomes stats
+Make some very simple stats to see if any assembly gives an obvious red flag. I will not include the activation of conda env, since some people may have tools installed directly or as modules. it is up to you to make sure you have the necessary tools.
+
+```{bash}
+#move to my brassica folder and create a QC_stats folder
+cd $WORKDIR
+
+#create QC and LOG directories
+mkdir -p "$QCDIR" "$LOGDIR"
+
+#create a summary table of assembly stats for all the genomes.
+assembly-stats -t "${GENOMES_DIR}"/*.fasta > "$QCDIR/Initial_ASM_stats_table.txt"
+```
+
+## 3) Edit contig names
+This is to create unique contig names for each genome. In this case I am adding the genome name as a prefix.
+You need to make sure the only *.fasta files in your $GENOMES_DIR folder are your genomes. if you run this twice, it will skip any file alread named *_renamed.fasta
+
+```{bash}
+#make directory of renamed genomes
+mkdir -p "$GENOMES_RENAMED_DIR"
+
+#quickly see how the headers look before editing
+grep ">" "$(ls "$GENOMES_DIR"/*.fasta | head -n 1)" | head -n 5
+
+#edit headers of all genomes at once with a loop
+for genome in "$GENOMES_DIR"/*.fasta; do
+    # Skip files that already contain _renamed
+    [[ "$genome" == *_renamed.fasta ]] && continue
+
+    # Get the base name without path
+    base=$(basename "$genome" .fasta)
+
+    # Extract the prefix: everything before _Genome
+    #ATTENTION: this may change based on how the genomes are named and you may end up with annoying contig names.
+    prefix="${base%%_Genome}_"
+
+    # Output file as _renamed.fasta
+    out="$GENOMES_RENAMED_DIR/${base}_renamed.fasta"
+
+    # Run seqkit replace with correct prefix
+    seqkit replace -p ^ -r "$prefix" "$genome" > "$out"
+done
+
+#quickly see how the headers look after editing for the first file it finds.
+grep ">" "$(ls "$GENOMES_RENAMED_DIR"/*_renamed.fasta | head -n 1)" | head -n 5
+```
+
+## 4) Create graph pangenome .gfa file with minigraph
+The idea is to first choose the best genome as the reference (first one). Then iteratively map the rest of the genomes against first the reference, then the .gfa file produced at each step.
+This is computational intensive so submitted it as a job.
+
+```{bash}
+#create minigraph output folder
+mkdir -p "$MINIDIR"
+
+# collect *_renamed.fasta files (naturally sorted)
+mapfile -t files < <(printf '%s\n' "$GENOMES_RENAMED_DIR"/*_renamed.fasta 2>/dev/null | sort -V)
+echo "Found ${#files[@]} file(s)." >&2
+
+# require at least two inputs
+if [ "${#files[@]}" -lt 2 ]; then
+  echo "ERROR: need at least 2 *_renamed.fasta files in $GENOMES_RENAMED_DIR" >&2
+  exit 1
+fi
+
+# determine final round dynamically and therefore the file name of the final round
+last_round=$(( ${#files[@]} - 1 ))
+graphGFA="${MINIDIR}/${species}_round${last_round}.gfa"
+echo "Final graph will be: $graphGFA"
+
+# choose initial pair (respect REF if provided)
+if [ -n "${REF:-}" ]; then
+  ref_path=""
+  for f in "${files[@]}"; do
+    if [ "$f" = "$REF" ] || [ "$(basename "$f")" = "$REF" ]; then
+      ref_path="$f"
+      break
+    fi
+  done
+  if [ -z "$ref_path" ]; then
+    echo "ERROR: reference '$REF' not found in $GENOMES_RENAMED_DIR" >&2
+    exit 1
+  fi
+
+  # Put the reference first and remove its other occurrence
+  newfiles=("$ref_path")
+  for f in "${files[@]}"; do
+    if [ "$f" != "$ref_path" ]; then
+      newfiles+=("$f")
+    fi
+  done
+  files=("${newfiles[@]}")
+fi
+
+# now set the initial pair and start index in the normal, simple way
+first="${files[0]}"
+second="${files[1]}"
+start_i=2
+
+# round 1 with chosen pair
+round=1
+echo "Round $round: $first + $second"
+minigraph -t "$THREADS" -cxggs -f.1 "$first" "$second" > "$MINIDIR/${species}_round${round}.gfa"
+
+# iteratively add remaining genomes starting from start_i
+for (( i=start_i; i<${#files[@]}; i++ )); do
+  prev="$MINIDIR/${species}_round${round}.gfa"
+  round=$((round + 1))
+  echo "Round $round: $prev + ${files[i]}"
+  minigraph -t "$THREADS" -cxggs -f.1 "$prev" "${files[i]}" > "$MINIDIR/${species}_round${round}.gfa"
+done
+
+echo "Done — final graph: $MINIDIR/${species}_round${round}.gfa"
+
+#save the graphGFA path for later so we don't have to redo the whole thing. Because this name has {round} I cannot set this alias at the begining because the termina doesn't know what round is.
+echo "$graphGFA" > "$MINIDIR/${species}_graphGFA_file_name.txt"
+
+#so then in later steps I only have to use
+graphGFA=$(<"$MINIDIR/${species}_graphGFA_file_name.txt")
+echo $graphGFA
+
+```
+
+## 5) Create basic stats table of the graph
+This commands creates a summary table of several stats from each round, like number of segments, links, unique genome IDs, and total segment length
+
+```{bash}
+mkdir -p "$QCDIR"
+# Directory where the .gfa rounds are stored and output table path
+graphGFA=$(<"$MINIDIR/${species}_graphGFA_file_name.txt")
+OUTFILE="$QCDIR/${species}_graph_stats_table.tsv"
+
+# Print table header
+echo -e "Round\tNum_Segments\tNum_Links\tGenomes\tTotal_Segment_Length\tAvg_Segment_Length" > "$OUTFILE"
+
+# Loop over all Bnapus_round*.gfa files, sorted by round number
+for gfa in $(ls "${MINIDIR}"/"${species}"_round*.gfa | sort -V); do
+    # Extract round name from filename
+    round=$(basename "$gfa" .gfa | sed 's/"${species}"_//')
+
+    # Number of segments
+    num_segments=$(grep -c '^S' "$gfa")
+
+    # Number of links
+    num_links=$(grep -c '^L' "$gfa")
+
+    # Unique genome IDs (comma-separated)
+    genomes=$(grep -o 'SN:Z:[^[:space:]]*' "$gfa" | sort | uniq | paste -sd "," -)
+
+    # Total segment length
+    total_length=$(grep '^S' "$gfa" | awk '{sum+=length($3)} END {print sum}')
+
+    # Average segment length
+    if [[ "$num_segments" -gt 0 ]]; then
+        avg_length=$(awk -v total="$total_length" -v n="$num_segments" 'BEGIN{printf "%.2f", total/n}')
+    else
+        avg_length=0
+    fi
+
+    # Append stats to output file
+    echo -e "${round}\t${num_segments}\t${num_links}\t${genomes}\t${total_length}\t${avg_length}" >> "$OUTFILE"
+done
+
+echo "Graph stats table written to $OUTFILE"
+```
+
+
+## 6) rename contig names again
+I need to rename again each contig of each genome because minigraph doesn't like it if the graph has the same contig name as the genomes. I added "realign_" to the start of each contig.
+
+```{bash}
+#set and create working directories
+mkdir -p "$MAPDIR" "$GENOMES_RENAMED_AGAIN_DIR"
+
+# Loop over all *_renamed.fasta files adding "realign_" to each contig
+for file in "$GENOMES_RENAMED_DIR"/*_renamed.fasta; do
+    [[ -f "$file" ]] || continue
+    base=$(basename "$file")
+    out="$GENOMES_RENAMED_AGAIN_DIR/${base%.*}_again.fasta"
+    sed 's/^>\(.*\)/>realign_\1/' "$file" > "$out"
+    echo "Wrote $out"
+done
+
+#quickly see how the headers look after editing for the first file it finds.
+grep ">" "$(ls "$GENOMES_RENAMED_AGAIN_DIR"/*_again.fasta | head -n 1)" | head -n 5
+```
+
+## 7) Map every genome back to the graph
+This step is computationally heavy so I submitted it as an array job. Below are the steps to make the .sh file as well as what was in it.
+
+WARNING: this is the only step that is a .sh batch and it is not fully automated. it was too convoluded to try to get sbatch to automatically decide the number of arrays. so you need to manually set =array=0-n (n being the number of genomes -1). Also adapt MEM and time to fit your data and the directory of output and error. Also you need to manually load modules or conda env, depending on how you installed the tools (I have removed my conda activate to avoid confusion, but it will not work if you do not add that to the script)
+```{bash}
+#create a .sh file
+rm "${WORKDIR}"/minigraph_Map_job.sh
+nano "${WORKDIR}"/minigraph_Map_job.sh
+
+#!/bin/bash -l
+#SBATCH --job-name=Bnapus_minigraph
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=32
+#SBATCH --account=pawsey0149
+#SBATCH --time=1:00:00
+#SBATCH --array=0-4
+#SBATCH --output=/scratch/pawsey0149/falbornoz/brassica2/logs/Bnapus_minigraph%A_%a.out
+#SBATCH --error=/scratch/pawsey0149/falbornoz/brassica2/logs/Bnapus_minigraph%A_%a.err
+#SBATCH --partition=work
+
+########CHANGE THESE TO FIT YOUR FILES AND FOLDERS
+#your working directory
+WORKDIR="$MYSCRATCH/brassica2"
+#where are your assemblies in .fasta format
+GENOMES_DIR="$WORKDIR/genomes"
+#number of threads to use for commands
+THREADS=20
+#Species name. this is for naming of files
+species="Bnapus"
+#genome/assembly that will be used as reference in minigraph
+
+
+
+####these ones below do not need to be edited, unless you want a different folder naming system. but they should be copy/pasted to certain steps. but just to be safe copy/paste them all at each step. it won't hurt.
+#folder for some logs
+LOGDIR="$WORKDIR/logs"
+#folder for some QC stats and summaries
+QCDIR="$WORKDIR/QC_stats"
+#folder for .fasta assemblies after renaming contigs
+GENOMES_RENAMED_DIR="$GENOMES_DIR/renamed"
+#folder for .fasta assemblies after renaming contigs back to their original
+GENOMES_RENAMED_AGAIN_DIR="$GENOMES_RENAMED_DIR/again"
+#folder for the outputs of minigraph rounds as .gfa and after transforming to .bed file
+MINIDIR="$WORKDIR/minigraph_output"
+#folder for the outputs of .gfa graph after sorting it
+MINIDIR_SORTED="$MINIDIR/sorted"
+#folder for .gaf file output of mapping of each genome agains the .sorted.bed graph file
+MAPDIR="$WORKDIR/graph_map"
+#folder for the transformed .gaf files into .bed files
+MAPDIR_BED="$MAPDIR/gaf_to_bed"
+#folder for after sorting the .bed files for each .gaf mapping
+MAPDIR_BED_SORTED="$MAPDIR_BED/sorted"
+#folder for the PAV matrix
+PAV_DIR="$WORKDIR/PAV_OUT"
+#folder for the .gff annotations of each genome.
+GFF_DIR="$WORKDIR/genome_annotation"
+REF="$GENOMES_RENAMED_DIR/a55015_Genome_renamed.fasta"
+#set working directories
+mkdir -p "$MAPDIR"
+
+ASMS=("$GENOMES_RENAMED_AGAIN_DIR"/*_renamed_again.fasta)
+graphGFA=$(<"$MINIDIR/${species}_graphGFA_file_name.txt")
+
+#get the final round, simply for file name calling
+round=$(basename "$graphGFA" .gfa)
+round=${round#${species}_}
+
+#extract number of genomes for the array
+NUM_ASMS=${#ASMS[@]}
+echo "Found $NUM_ASMS genome(s) in $GENOMES_RENAMED_AGAIN_DIR"
+
+# check array index is valid
+if [ -z "${SLURM_ARRAY_TASK_ID+x}" ]; then
+  echo "SLURM_ARRAY_TASK_ID is not set" >&2
+  exit 1
+fi
+
+if (( SLURM_ARRAY_TASK_ID < 0 )) || (( SLURM_ARRAY_TASK_ID >= NUM_ASMS )); then
+  echo "Array index ${SLURM_ARRAY_TASK_ID} out of range (0..$((NUM_ASMS-1)))" >&2
+  exit 2
+fi
+
+#create base names for each genome
+INPATH="${ASMS[$SLURM_ARRAY_TASK_ID]}"
+BASENAME="$(basename "$INPATH")"
+NAME="${BASENAME%.*}"        
+
+echo "Task $SLURM_ARRAY_TASK_ID -> input: $INPATH"
+echo "Output will be: $MAPDIR/${NAME}_vs_${species}_${round}.gaf"
+
+# grabs our filename from a directory listing and run minigraph of each genome against the graph
+minigraph -cxasm -t "${SLURM_CPUS_PER_TASK}" -f.1 "$graphGFA" "$INPATH" > "${MAPDIR}/${NAME}_vs_${species}_${round}.gaf"
+
+###### UP TO HERE IS THE BATCH JOB
+
+#submit the job
+sbatch "${WORKDIR}"/minigraph_Map_job.sh
+```
+
+## 8) Sanity check and stats
+This created a summary table of each genome mapped against the graph.
+
+```{bash}
+#get the final round, simply for file name calling
+graphGFA=$(<"$MINIDIR/${species}_graphGFA_file_name.txt")
+round=$(basename "$graphGFA" .gfa)
+round=${round#${species}_}
+
+#check number of lines.
+wc -l "${MAPDIR}"/*_vs_${species}_"${round}".gaf
+
+#create a summary table of stats
+{
+echo -e "Genome\tTotal_Aligned\tTotal_Matches\tTotal_Query_Length\tCoverage"
+
+for f in "${MAPDIR}"/*_vs_${species}_"${round}".gaf; do
+    awk '
+    {
+        total_aligned += $11;
+        total_matches += $10;
+        qlen[$1] = $2
+    }
+    END {
+        qtotal = 0;
+        for (q in qlen) qtotal += qlen[q];
+        coverage = total_aligned / qtotal;
+        print FILENAME "\t" total_aligned "\t" total_matches "\t" qtotal "\t" coverage
+    }
+    ' "$f"
+done
+} > "${QCDIR}/${species}_gaf_summary.tsv"
+```
+
+## 9) tranform .gfa graph file to .bed and then sort it
+This is also computationally heavy.
+
+```{bash}
+conda activate "$MYSCRATCH/conda_env/gaftools"
+#get the final round, simply for file name calling
+graphGFA=$(<"${MINIDIR}/${species}_graphGFA_file_name.txt")
+round=$(basename "$graphGFA" .gfa)
+round=${round#${species}_}
+
+#create folder and set aliases
+mkdir -p "$MINIDIR_SORTED"
+
+graphGFA="${MINIDIR}/${species}_${round}.gfa"
+graphBed="${MINIDIR}/${species}_${round}.bed"
+graphBedSorted="${MINIDIR_SORTED}/${species}_${round}.sorted.bed"
+
+#transform the graph pangenome .gfa to .bed and sort it
+gfatools gfa2bed "$graphGFA" > "$graphBed"
+sort -k1,1 -k2,2n "$graphBed" > "$graphBedSorted"
+```
+
+## 10) Create a .genome file that is needed for the PAV table
+I adapted this from Teng's script (he fixed a bug in Phillip's code) to be used for any .bed graph, instead of having to edit the .py every time. you should only need to create BedToGenome.py once, and it should be able to be used in the future for any data without having to modify anything within BedToGenome.py.
+
+```{bash}
+#get the final round, simply for file name calling
+graphGFA=$(<"$MINIDIR/${species}_graphGFA_file_name.txt")
+round=$(basename "$graphGFA" .gfa)
+round=${round#${species}_}
+
+#create file aliases
+graphGFA="${MINIDIR}/${species}_${round}.gfa"
+graphBed="${MINIDIR}/${species}_${round}.bed"
+graphBedSorted="${MINIDIR_SORTED}/${species}_${round}.sorted.bed"
+graphBedSorted_genome="${MINIDIR_SORTED}/${species}_${round}.genome"
+
+#create .py file
+nano BedToGenome.py
+
+##from here is what to put inside the .py file
+#!/usr/bin/env python3
+
+import sys
+
+if len(sys.argv) < 2:
+    print("Usage: python BedToGenome.py <input.bed>")
+    sys.exit(1)
+
+bed_file = sys.argv[1]
+
+big_dict = {}
+
+with open(bed_file) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        chrom, start, end, *bla = line.split()
+        end = int(end)
+        if chrom not in big_dict:
+            big_dict[chrom] = end
+        elif end > big_dict[chrom]:
+            big_dict[chrom] = end
+
+for c in big_dict:
+    print(f'{c}\t{big_dict[c]}')
+## here is where the script end
+
+#give execute permissions
+chmod +x BedToGenome.py
+
+#run BedToGenome.py the first argument after BedToGenome.py should be you graph in .bed format and sorted.
+python3 BedToGenome.py "$graphBedSorted" > "$graphBedSorted_genome"
+```
+
+## 11) Convert all .gaf files to .bed files before creating PAV matrix
+I slightly adapted this .py script to fit .gaf files outside the script so we don't have to be constantly renaming files and creating new .py for every dataset, same as above
+
+This script transforms .gaf to .bed, then at the end sorts them and places them in their own folder
+
+```{bash}
+#create new directory where the .bed files created from the .gaf files will be placed
+mkdir -p "$MAPDIR_BED"
+
+#create the gaf_to_bed.py
+nano gaf_to_bed.py
+
+###below is what to copy inside the .py file
+#!/usr/bin/env python3
+import sys
+import re
+
+shorts, badq, nonp, malformed, good = 0, 0, 0, 0, 0
+
+split_re = re.compile(r'[<>]')
+
+for raw in open(sys.argv[1]):
+    line = raw.rstrip().split('\t')
+    if len(line) < 13:
+        malformed += 1
+        continue
+
+    try:
+        aln_block = int(line[10])   # GAF col11
+        mapq = int(line[11])        # GAF col12
+        target_start = int(line[7]) # GAF col8
+        target_end   = int(line[8]) # GAF col9
+    except ValueError:
+        malformed += 1
+        continue
+
+    align_type = None
+    for field in line[12:]:
+        if field.startswith("tp:A:"):
+            align_type = field.split(":")[-1]
+            break
+
+    if aln_block < 100:
+        shorts += 1
+        continue
+    if mapq < 10:
+        badq += 1
+        continue
+    if align_type != 'P':
+        nonp += 1
+        continue
+
+    good += 1
+
+    path_string = line[5]
+    parts = split_re.split(path_string)
+
+    for p in parts:
+        if not p:
+            continue
+
+        # case 1: contains explicit coordinates, e.g. chrom:start-end
+        if ':' in p and '-' in p:
+            try:
+                chrom, rest = p.rsplit(':', 1)
+                start, end = rest.rsplit('-', 1)
+                start = int(start)
+                end = int(end)
+            except ValueError:
+                malformed += 1
+                continue
+
+        # case 2: only a target name, use GAF target coords
+        else:
+            chrom = p
+            start = target_start
+            end = target_end
+
+        if end > start:
+            print(f"{chrom}\t{start}\t{end}")
+
+print(
+    f"#good={good} shorts={shorts} badq={badq} nonp={nonp} malformed={malformed}",
+    file=sys.stderr
+)
+
+##up to here is the script
+
+#give the script execute permission
+chmod +x gaf_to_bed.py
+
+#run the script on all the .gaf files in a loop
+for GAF in "$MAPDIR"/*.gaf; do
+    python gaf_to_bed.py "$GAF" > "$MAPDIR_BED"/$(basename "$GAF" .gaf).bed
+done
+
+#create new directory for the sorted new .bed files from the .gaf files.
+mkdir -p "$MAPDIR_BED_SORTED"
+
+#sort all the newly made .bed files and put them in their own folder
+for GAF in "$MAPDIR_BED"/*.bed; do
+    sort -k1,1 -k2,2n "$GAF" > "$MAPDIR_BED_SORTED"/$(basename "$GAF" .bed)_sorted.bed
+done
+```
+
+## 11) Create the segment PAV table
+We need to include the graph as part of the list of genomes after the -i command, so we can know the total number of segments the graph had and if any segments were not found in any genome (due to filtering or linearisation, maybe?). But the 'Graph' column from the final PAV table should be removed before downstream analyses because it should have all 1s.
+
+```{bash}
+module load bedtools/2.30.0--h468198e_3
+#get the final round, simply for file name calling
+graphGFA=$(<"${MINIDIR}/${species}_graphGFA_file_name.txt")
+round=$(basename "$graphGFA" .gfa)
+round=${round#${species}_}
+
+graphBedSorted="${MINIDIR_SORTED}/${species}_${round}.sorted.bed"
+graphBedSorted_genome="${MINIDIR_SORTED}/${species}_${round}.genome"
+
+#make new directory to where the PAV table will be placed
+mkdir -p "$PAV_DIR"
+
+#this will be the PAV table
+out="${PAV_DIR}/${species}_${round}.PAV.graph.bed"
+
+# collect map files (in glob order) to create a list of names
+map_files=( "$MAPDIR_BED_SORTED"/*_renamed_again_vs_${species}_${round}_sorted.bed )
+
+if [ "${#map_files[@]}" -eq 0 ]; then
+  echo "No map files found in $MAPDIR_BED_SORTED" >&2
+  exit 1
+fi
+
+# build names string starting with the graph: "Graph,<sample1>,<sample2>,..."
+names="Graph"
+for f in "${map_files[@]}"; do
+  bn=$(basename "$f")
+  sample=${bn%_renamed_again_vs_${species}_${round}_sorted.bed}
+  names+=" ${sample}"
+done
+
+# show what will be run to check the name list is correct
+echo "names: $names"
+echo "files: $graphBedSorted ${map_files[*]}"
+
+#run multiinter. notice that "$graph" is input before the $names list
+bedtools multiinter -header \
+  -g "$graphBedSorted_genome" \
+  -names $names \
+  -i "$graphBedSorted" "${map_files[@]}" \
+> "$out"
+
+#remove the list column that just adds size to the PAV file
+cut --complement -f5 "$out" > "${out%.bed}.nolists.bed"
+
+
+```
+
+
+
+## 12) sanity checks
+I am not entirely sure how one checks that the final PAV table is what it is supposed to be. Mitch and I got a table previously with no errors, but the results were non-sensincal, so it was easy to spot something went wrong. but that made me paranoid that I could get a wrong table with 'not-so-obvious' mistakes. So I ran a bunch of sanity checks. Please let me know if you think of any of you spot something odd.
+
+By looking at number of segments, they do not match between the PAV and the graph .bed file. I originally thought that meant it was a mistake. but after massaging the data a bit, I realised some segments were either fragmented into multiple pieces, or combined. but overall there is a 100% overlap between all the segments in the PAV and the .bed graph. So I assume this table was done correctly.
+
+I placed all the sanity checks in a .txt file in "$QCDIR/sanity_checks.txt"
+
+```{bash}
+#get the final round, simply for file name calling
+graphGFA=$(<"${MINIDIR}/${species}_graphGFA_file_name.txt")
+round=$(basename "$graphGFA" .gfa)
+round=${round#${species}_}
+
+graphBedSorted="${MINIDIR_SORTED}/${species}_${round}.sorted.bed"
+graphBedSorted_genome="${MINIDIR_SORTED}/${species}_${round}.genome"
+PAV_table="${PAV_DIR}/${species}_${round}.PAV.graph.nolists.bed"
+
+# =====================================================
+# SET OUTPUT LOG FILE
+# =====================================================
+LOGFILE="$QCDIR/sanity_checks.txt"
+
+
+echo "-----------------------------------" >> "$LOGFILE"
+echo "SANITY CHECKS POST PAV MAKING" >> "$LOGFILE"
+echo "Sanity checks run on: $(date)" >> "$LOGFILE"
+echo "-----------------------------------" >> "$LOGFILE"
+
+# =====================================================
+# 1. VERIFY FILE NUMBERS AND GRAPH FILE
+# =====================================================
+echo "-----------------------------------" >> "$LOGFILE"
+echo "1. VERIFY FILE NUMBERS AND GRAPH FILE" >> "$LOGFILE"
+echo "--------------------------------------" >> "$LOGFILE"
+
+# Count expected genomes
+echo "Count expected genomes" >> "$LOGFILE"
+num_genomes=$(ls "$GENOMES_RENAMED_DIR"/*_renamed_again.fasta 2>/dev/null | wc -l)
+echo "Number of genomes in "$GENOMES_RENAMED_DIR": $num_genomes" >> "$LOGFILE"
+
+num_mapfiles=$(ls "$MAPDIR_BED_SORTED"/*_renamed_again_vs_${species}_${round}_sorted.bed 2>/dev/null | wc -l)
+echo "Number of mapped .bed files: $num_mapfiles" >> "$LOGFILE"
+echo "Expected (genomes): $((num_genomes))" >> "$LOGFILE"
+if [ "$num_mapfiles" -eq "$((num_genomes))" ]; then
+  echo "Correct number of mapping files"
+else
+  echo "ERROR: Number of mapping files does not match"
+fi >> "$LOGFILE"
+echo "--------------------------------------" >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+# Compare graph segment count
+echo "Compare graph segment count between .gfa and .bed" >> "$LOGFILE"
+gfa_segment_count=$(grep -c '^S' "$graphGFA")
+bed_segment_count=$(wc -l < "$graphBedSorted")
+echo "Segments in graph .gfa file: $gfa_segment_count" >> "$LOGFILE"
+echo "Segments in graph .bed file: $bed_segment_count" >> "$LOGFILE"
+if [ "$gfa_segment_count" -eq "$bed_segment_count" ]; then
+  echo "Graph BED derived correctly from GFA"
+else
+  echo "WARNING: Segment count mismatch between GFA and BED"
+fi >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+
+# =====================================================
+# 2. VERIFY SEGMENT PRESENCE IN GRAPH PANGENOME
+# =====================================================
+echo "-----------------------------------" >> "$LOGFILE"
+echo "2. CHECKING SEGMENT PRESENCE IN GRAPH" >> "$LOGFILE"
+echo "--------------------------------------" >> "$LOGFILE"
+
+# unique segment IDs (s1, s2, ...)
+echo "--------------------------------------" >> "$LOGFILE"
+echo "unique segment IDs in graph .sorted.bed" >> "$LOGFILE"
+awk -F'\t' '{gsub("\r",""); print $4}' "$graphBedSorted" | sort -u > /tmp/graph_seg_ids.txt
+echo "graph unique segment IDs:" $(wc -l < /tmp/graph_seg_ids.txt) >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+
+# unique graph coords CHR:START:END
+echo "unique graph coords CHR:START:END in graph .sorted.bed" >> "$LOGFILE"
+awk -F'\t' '{gsub("\r",""); print $1":"$2":"$3}' "$graphBedSorted" | sort -u > /tmp/graph_coords.txt
+echo "graph unique coordinate keys:" $(wc -l < /tmp/graph_coords.txt) >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+# PAV coordinate keys (skip header)
+echo "unique coordinate keys in PAV table" >> "$LOGFILE"
+awk -F'\t' 'NR>1{gsub("\r",""); print $1 ":" $2 ":" $3}' "$PAV_table" | sort -u > /tmp/pav_coords.txt
+echo "PAV unique coordinate keys:" $(wc -l < /tmp/pav_coords.txt) >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+# also full PAV rows count (excl header)
+echo "Number of segments in PAV table" >> "$LOGFILE"
+echo "PAV rows (excl header):" $(tail -n +2 "$PAV_table" | wc -l) >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+
+# Row count match
+pav_row_count=$(tail -n +2 "$PAV_table" | wc -l)
+echo "Comparing number of rows in PAV with unique segments in graph" >> "$LOGFILE"
+echo "Rows in PAV table (excluding header): $pav_row_count" >> "$LOGFILE"
+echo "Segments in graph .bed file: $bed_segment_count" >> "$LOGFILE"
+if [ "$pav_row_count" -eq "$bed_segment_count" ]; then
+  echo "All graph segments represented in PAV table"
+else
+  echo "ERROR: Row count mismatch"
+fi >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+# how many graph coords are not present in PAV (graph-only)
+echo "Number of graph coords are not present in PAV" >> "$LOGFILE"
+echo "graph-only coords count:" $(comm -23 /tmp/graph_coords.txt /tmp/pav_coords.txt | wc -l) >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+# how many PAV coords are not present in graph (pav-only)
+echo "Number of PAV coords are not present in graph" >> "$LOGFILE"
+echo "pav-only coords count:" $(comm -13 /tmp/graph_coords.txt /tmp/pav_coords.txt | wc -l) >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+
+# =====================================================
+# 3. CHECKING SEGMENT OVERLAP BETWEEN PAV AND GRAPH BASED ON COORDINATES
+# =====================================================
+echo "-----------------------------------" >> "$LOGFILE"
+echo "3. CHECKING SEGMENT OVERLAP BETWEEN PAV AND GRAPH BASED ON COORDINATES" >> "$LOGFILE"
+echo "--------------------------------------" >> "$LOGFILE"
+
+
+# prepare PAV without header (bedtools-friendly)
+tail -n +2 "$PAV_table" | sed 's/\r$//' > /tmp/pav_nohead.bed
+
+# 1) how many unique graph segment IDs overlap any PAV row?
+echo "--------------------------------------" >> "$LOGFILE"
+echo "Checking graph segments overlapping any PAV rows based on coordinates" >> "$LOGFILE"
+bedtools intersect -a "$graphBedSorted" -b /tmp/pav_nohead.bed -wa -u > /tmp/graph_overlapping_pav.bed
+graph_overlap_unique=$(awk -F'\t' '{print $4}' /tmp/graph_overlapping_pav.bed | sort -u | wc -l)
+graph_total_unique=$(awk -F'\t' '{print $4}' "$graphBedSorted" | sed 's/\r$//' | sort -u | wc -l)
+printf "Graph segments overlapping any PAV: %d / %d (%.2f%%)\n" "$graph_overlap_unique" "$graph_total_unique" "$(awk -v a=$graph_overlap_unique -v b=$graph_total_unique 'BEGIN{if(b==0) print 0; else printf 100*a/b}')" >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+# 2) how many PAV rows overlap any graph segment?
+echo "Checking PAV rows overlapping any graph segment based on coordinates" >> "$LOGFILE"
+bedtools intersect -a /tmp/pav_nohead.bed -b "$graphBedSorted" -wa -u > /tmp/pav_overlapping_graph.bed
+pav_overlap_rows=$(wc -l < /tmp/pav_overlapping_graph.bed)
+pav_total_rows=$(wc -l < /tmp/pav_nohead.bed)
+printf "PAV rows overlapping any graph segment: %d / %d (%.2f%%)\n" "$pav_overlap_rows" "$pav_total_rows" "$(awk -v a=$pav_overlap_rows -v b=$pav_total_rows 'BEGIN{if(b==0) print 0; else printf 100*a/b}')" >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+# 3) list graph segments that do NOT overlap any PAV row (true graph-only)
+echo "list graph segments that do NOT overlap any PAV row" >> "$LOGFILE"
+bedtools intersect -a "$graphBedSorted" -b /tmp/pav_nohead.bed -v > /tmp/graph_no_overlap.bed
+
+graph_no_overlap_n=$(wc -l < /tmp/graph_no_overlap.bed)
+echo "Graph segments with zero overlap: $graph_no_overlap_n" >> "$LOGFILE"
+
+awk 'NR<=20{print $0}' /tmp/graph_no_overlap.bed >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+# 4) list PAV rows that do NOT overlap any graph segment (true pav-only)
+echo "list PAV rows that do NOT overlap any graph segment" >> "$LOGFILE"
+bedtools intersect -a /tmp/pav_nohead.bed -b "$graphBedSorted" -v > /tmp/pav_no_overlap.bed
+
+pav_no_overlap_n=$(wc -l < /tmp/pav_no_overlap.bed)
+echo "PAV rows with zero overlap: $pav_no_overlap_n" >> "$LOGFILE"
+
+awk 'NR<=20{print $0}' /tmp/pav_no_overlap.bed >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+
+# 5) show a few exact overlapping pairings (graph line + corresponding PAV line)
+echo "Example overlapping hits (graph line ||| matching PAV row):" >> "$LOGFILE"
+bedtools intersect -a "$graphBedSorted" -b /tmp/pav_nohead.bed -wa -wb | head -n 12 >> "$LOGFILE"
+echo "-----------------------------------" >> "$LOGFILE"
+echo "" >> "$LOGFILE"
+echo "-----------------------------------" >> "$LOGFILE"
+echo "END OF SANITY CHECK" >> "$LOGFILE"
+echo "-----------------------------------" >> "$LOGFILE"
+
+
+```
+
+## XX) OPTIONAL - PROBABLY NOT NEEDED IN FUTURE BUT NEEDED HERE!!!
+There were discrepancies betweene the genome.fasta files and their associated .gff files in the number of contigs. so I had to remove any contig from the .gff files that were not present in the .fasta files.
+
+SKIP this step if you don't have that issue. but keep in mind the next step will assume the .gff files are called $GFF_DIR"/*_filtered.gff
+
+```{bash}
+
+GFFs=("$GFF_DIR"/*.gff)
+
+
+#for some reason there were scaffolds in the .gff files that were not in the .fasta genomes, so removing those
+for genome in "${GFFs[@]}"; do
+    # Skip files that already contain _renamed
+    [[ "$genome" == *_filtered.gff ]] && continue
+
+    # Get the base name without path
+    base=$(basename "$genome" .Genome.uncat.fasta.all_round_3_clean.gff)
+
+    # Extract the prefix: everything before _Genome
+    prefix="${base%%_Genome}_"
+
+    # Output file
+    out="$GFF_DIR/${base}_Genome_filtered.gff"
+
+    # Run seqkit replace with correct prefix
+    awk '$1 !~ /scaffold/' "$genome" > "$out"
+done
+
+#check on the first one that it has the same number of unique contigs as the genome
+cut -f1 "$(ls "$GFF_DIR"/*_filtered.gff | head -n 1)" | sort | uniq | wc -l
+grep ">" "$(ls "$GENOMES_RENAMED_DIR"/*_renamed.fasta | head -n 1)" | sort | uniq | wc -l
+
+```
+
+
+## 13) Intersect annotations with graph
+One should first rename the genome.fasta contigs back to match the names in the .gff files. we renamed the contig names twice during this step. But luckily, the renamed.fasta created in this pipeline match the .gff files. So I think that would be a better way of doing this:
+
+1. rename contigs of .fasta files to _renamed.fasta
+2. annotate the _renamed.fasta
+3. Run this pipeline.
+
+Instead of annotating the original fasta file and then having to run in circles to get back to it.
+
+This step requires the PAV table (I am using the one without the list column) plus each of the *_filtered.gff files for each genome.
+
+```{bash}
+
+for fasta in genomes/renamed/*_Genome_renamed.fasta; do
+    sed '/^>/ {
+        s/_20210603//g
+        s/-/_/g
+    }' "$fasta" > "${fasta%.fasta}_tmp.fasta"
+
+    mv "${fasta%.fasta}_tmp.fasta" "$fasta"
+done
+
+
+sed -e 's/_20210603//g' \
+    -e 's/-/_/g' \
+    "$PAV_table" > tmp.bed
+
+mv tmp.bed "$PAV_table"
+
+module load bedtools/2.30.0--h468198e_3
+#path for the annotation files in .gff format
+GFFs=("$GFF_DIR"/*_filtered.gff)
+
+#get the final round, simply for file name calling
+graphGFA=$(<"${MINIDIR}/${species}_graphGFA_file_name.txt")
+round=$(basename "$graphGFA" .gfa)
+round=${round#${species}_}
+
+#name of the input PAV table created in step 11
+PAV_table="${PAV_DIR}/${species}_${round}.PAV.graph.nolists.bed"
+
+#name of the output PAV table with the structural annotations
+PAV_table_annotated="$PAV_DIR/${species}_${round}_annotated_PAV_graph.nolists.bed"
+
+# sanity: need at least one GFF
+if [ "${#GFFs[@]}" -eq 0 ]; then
+  echo "ERROR: no *_filtered.gff files found in $GFF_DIR" >&2
+fi
+
+# build a simple logging string (space-separated)
+gff_list=""
+for f in "${GFFs[@]}"; do
+  bn=$(basename "$f")
+  gff_list+=" ${bn%_filtered.gff}"
+done
+
+echo "PAV table: $PAV_table"
+echo "GFFs (${#GFFs[@]}):${gff_list}"
+echo "Output: $PAV_table_annotated"
+
+# check PAV table exists
+if [ ! -e "$PAV_table" ]; then
+  echo "ERROR: PAV table does not exist: $PAV_table" >&2
+fi
+#intersect the PAV table with the .gff files
+bedtools intersect -loj -F 0.75 -a "$PAV_table" -b "${GFFs[@]}" > "$PAV_table_annotated"
+
+
+```
+
+
+
+
+
+
+
+## 11B subset annotated PAV to only columsn needed
+last steps included a lot of columns from the gff file that we do not need.
+
+```{bash}
+module load bedtools/2.30.0--h468198e_3
+#get the final round, simply for file name calling
+graphGFA=$(<"${MINIDIR}/${species}_graphGFA_file_name.txt")
+round=$(basename "$graphGFA" .gfa)
+round=${round#${species}_}
+
+graphBedSorted="${MINIDIR_SORTED}/${species}_${round}.sorted.bed"
+graphBedSorted_genome="${MINIDIR_SORTED}/${species}_${round}.genome"
+
+#make new directory to where the PAV table will be placed
+mkdir -p "$PAV_DIR"
+
+#this will be the PAV table
+out="${PAV_DIR}/${species}_${round}.PAV.graph.bed"
+
+# collect map files (in glob order) to create a list of names
+map_files=( "$MAPDIR_BED_SORTED"/*_renamed_again_vs_${species}_${round}_sorted.bed )
+
+export LC_ALL=C
+
+OUTDIR="${PAV_DIR}/teng"
+mkdir -p "$OUTDIR"
+
+# Graph BED first
+ROUND20_BED="${MINIDIR_SORTED}/${species}_${round}.sorted.bed"
+
+# Genome BEDs
+BED_FILES=( "$MAPDIR_BED_SORTED"/*_renamed_again_vs_${species}_${round}_sorted.bed )
+
+# Names must match BED_FILES order
+NAMES=(
+  "a55015"
+  "Bristol"
+  "DSV_1_20210603"
+  "DSV_2"
+  "ERA3543"
+)
+
+if [[ ${#BED_FILES[@]} -ne ${#NAMES[@]} ]]; then
+  echo "ERROR: BED_FILES and NAMES length mismatch" >&2
+  exit 1
+fi
+
+# Check inputs exist
+if [[ ! -s "$ROUND20_BED" ]]; then
+  echo "ERROR: missing graph BED: $ROUND20_BED" >&2
+  exit 1
+fi
+
+for f in "${BED_FILES[@]}"; do
+  if [[ ! -s "$f" ]]; then
+    echo "ERROR: missing genome BED: $f" >&2
+    exit 1
+  fi
+done
+
+OUTFILE="${OUTDIR}/teng_test_PAV.bed"
+
+bedtools multiinter \
+  -header \
+  -i "$ROUND20_BED" "${BED_FILES[@]}" \
+  -names round20 "${NAMES[@]}" \
+  > "$OUTFILE"
+
+echo "Done"
+echo "Output: $OUTFILE"
+
+
+
+
+#path for the annotation files in .gff format
+GFFs=("$GFF_DIR"/*_filtered.gff)
+
+#get the final round, simply for file name calling
+graphGFA=$(<"${MINIDIR}/${species}_graphGFA_file_name.txt")
+round=$(basename "$graphGFA" .gfa)
+round=${round#${species}_}
+
+#name of the input PAV table created in step 11
+PAV_table="$PAV_DIR/${species}_${round}.PAV.graph.nolists.bed"
+#name of the output PAV table with the structural annotations
+PAV_table_annotated="$PAV_DIR/${species}_${round}_annotated_PAV_graph.nolists.bed"
+PAV_table_annotated2="$PAV_DIR/${species}_${round}_annotated_PAV_graph.nolists2.bed"
+head -n 5 "$PAV_table_annotated" | awk -F'\t' '{for(i=1;i<=NF;i++) printf "Col %d: %s\n", i, $i}'
+
+
+
+rm gene_pav_from_raw.py
+nano gene_pav_from_raw.py
+
+import sys
+import re
+from collections import defaultdict
+
+infile = sys.argv[1]
+outfile = sys.argv[2]
+
+genomes = [
+  "a55015", "Bristol", "DSV_1", "DSV_2", "ERA3543"
+]
+
+gene_pav = defaultdict(lambda: [0] * len(genomes))
+gene_meta = {}
+
+def parse_attr(attr_string, key):
+    """
+    Parse GFF attributes like ID=xxx;Name=yyy
+    """
+    m = re.search(r'(?:^|;)' + re.escape(key) + r'=([^;]+)', attr_string)
+    return m.group(1) if m else None
+
+with open(infile) as fh:
+    header = fh.readline().rstrip("\n").split("\t")
+
+    if len(header) < 20:
+        sys.stderr.write(
+            f"ERROR: expected at least 33 columns in header, got {len(header)}\n"
+        )
+        sys.exit(1)
+
+    for line in fh:
+        ll = line.rstrip("\n").split("\t")
+        if len(ll) < 20:
+            continue
+
+        feature_type = ll[13]
+        if feature_type != "gene":
+            continue
+
+        annot_seqid = ll[11]
+        annot_start = ll[14]
+        annot_end = ll[15]
+        attributes = ll[19]
+
+        gene_id = parse_attr(attributes, "ID")
+        if gene_id is None:
+            gene_id = parse_attr(attributes, "Name")
+        if gene_id is None:
+            # fallback if neither ID nor Name is present
+            gene_id = f"{annot_seqid}:{annot_start}-{annot_end}"
+
+        # segment-level PAV values are columns 4..24 
+        try:
+            pav = [int(x) for x in ll[5:10]]
+        except ValueError:
+            continue
+
+        if gene_id not in gene_meta:
+            gene_meta[gene_id] = {
+                "seqid": annot_seqid,
+                "start": annot_start,
+                "end": annot_end,
+                "attributes": attributes
+            }
+
+        for i, v in enumerate(pav):
+            if v > gene_pav[gene_id][i]:
+                gene_pav[gene_id][i] = v
+
+with open(outfile, "w") as out:
+    out.write(
+        "\t".join(["GeneID", "AnnotSeqID", "AnnotFeatureStart", "AnnotFeatureEnd"] + genomes) + "\n"
+    )
+
+    for gene_id in sorted(gene_pav):
+        meta = gene_meta[gene_id]
+        row = [
+            gene_id,
+            meta["seqid"],
+            meta["start"],
+            meta["end"]
+        ] + [str(x) for x in gene_pav[gene_id]]
+        out.write("\t".join(row) + "\n")
+
+print(f"Wrote gene PAV matrix to: {outfile}", file=sys.stderr)
+print(f"Total genes: {len(gene_pav)}", file=sys.stderr)
+
+
+python gene_pav_from_raw.py "$PAV_table_annotated" brassica_gene_PAV_annotated_firstCode.tsv
+
+
+cut -f14 "$PAV_table_annotated" | sort | uniq -c | head
+
+
+## try something slightly different (it did not make a difference in the end)
+rm gene_pav_from_raw2.py
+nano gene_pav_from_raw2.py
+
+import sys
+import re
+from collections import defaultdict
+
+infile = sys.argv[1]
+outfile = sys.argv[2]
+
+genomes = ["a55015", "Bristol", "DSV_1", "DSV_2", "ERA3543"]
+
+gene_pav = defaultdict(lambda: [0] * len(genomes))
+gene_meta = {}
+
+def parse_attr(attr_string, key):
+    m = re.search(r'(?:^|;)' + re.escape(key) + r'=([^;]+)', attr_string)
+    return m.group(1) if m else None
+
+with open(infile) as fh:
+    header = fh.readline().rstrip("\n").split("\t")
+
+    # basic sanity check
+    if len(header) < 19:
+        sys.stderr.write(f"ERROR: unexpected column count: {len(header)}\n")
+        sys.exit(1)
+
+    for line in fh:
+        ll = line.rstrip("\n").split("\t")
+
+        if len(ll) < 19:
+            continue
+
+        # -----------------------------
+        # GFF columns (after LOJ column)
+        # -----------------------------
+        feature_type = ll[13]   # gene / mRNA / exon / CDS
+
+        # keep ONLY gene-level rows
+        if feature_type != "gene":
+            continue
+
+        annot_seqid = ll[11]
+        annot_start = ll[14]
+        annot_end = ll[15]
+        attributes = ll[19]
+
+        # -----------------------------
+        # gene ID extraction
+        # -----------------------------
+        gene_id = parse_attr(attributes, "ID")
+        if gene_id is None:
+            gene_id = parse_attr(attributes, "Name")
+        if gene_id is None:
+            gene_id = f"{annot_seqid}:{annot_start}-{annot_end}"
+
+        # -----------------------------
+        # PAV block (FIRST 10 columns)
+        # -----------------------------
+        try:
+            pav_raw = ll[0:10]
+            pav = [int(x) if x != "." else 0 for x in pav_raw[5:10]]
+        except (ValueError, IndexError):
+            continue
+
+        # -----------------------------
+        # metadata (keep first occurrence)
+        # -----------------------------
+        if gene_id not in gene_meta:
+            gene_meta[gene_id] = {
+                "seqid": annot_seqid,
+                "start": annot_start,
+                "end": annot_end,
+                "attributes": attributes
+            }
+
+        # -----------------------------
+        # collapse PAV (take max across overlaps)
+        # -----------------------------
+        for i, v in enumerate(pav):
+            if v > gene_pav[gene_id][i]:
+                gene_pav[gene_id][i] = v
+
+# -----------------------------
+# OUTPUT
+# -----------------------------
+with open(outfile, "w") as out:
+    out.write(
+        "\t".join(["GeneID", "AnnotSeqID", "AnnotFeatureStart", "AnnotFeatureEnd"] + genomes) + "\n"
+    )
+
+    for gene_id in sorted(gene_pav):
+        meta = gene_meta[gene_id]
+
+        row = [
+            gene_id,
+            meta["seqid"],
+            meta["start"],
+            meta["end"]
+        ] + [str(x) for x in gene_pav[gene_id]]
+
+        out.write("\t".join(row) + "\n")
+
+print(f"Wrote gene PAV matrix to: {outfile}", file=sys.stderr)
+print(f"Total genes: {len(gene_pav)}", file=sys.stderr)
+
+python gene_pav_from_raw2.py "$PAV_table_annotated2" brassica_gene_PAV_annotated_secondCode.tsv
+
+
+
+```
+
+
+
+
+
+
+
