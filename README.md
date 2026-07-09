@@ -8,5 +8,4 @@ assembly-stats *fasta > assembly_statistics.txt
 assembly-stats -t *fasta > assembly_statistics.txt
 
 ## Overview of files in repository
-
-<img width="1394" height="262" alt="image" src="https://github.com/user-attachments/assets/f2811408-78a0-476d-bca4-5cc5352123e7" />
+<img width="1394" height="262" alt="image" src="https://github.com/user-attachments/assets/4ddeb169-7d12-4f55-8669-ed78cab2cb18" />
