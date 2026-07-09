@@ -1,5 +1,5 @@
 # comparing_gene_PAV_methods
-Comparing orthogroup-based analysis and graph pangenome methods for determining gene PAV in crop species
+Comparing orthogroup-based analysis and graph pangenome methods for determining gene PAV in crop species. Commands were run on setonix HPC using work partition unless stated otherwise.
 
 ## Obtain statistics of assemblies using assembly-stats v1.0.1:
 assembly-stats *fasta > assembly_statistics.txt
